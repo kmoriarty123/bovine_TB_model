@@ -1,0 +1,443 @@
+---
+title: "Bovine TB for Possums Model"
+author : Andres Mena & Kathleen Moriarty
+date : 16.05.2021
+---
+
+```{r, setup, include=FALSE}
+
+rm(list = ls())
+
+library(deSolve)
+library(ggplot2)
+library(reshape2)
+library(Deriv)
+library(sensobol)
+library(foreach)
+library("data.table")
+library(FME)
+library(graphics)
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+library(tidyverse)
+
+```
+
+## Functions, parameters, and initial conditions to set up the model
+
+```{r}
+
+bovineM = function(Time, State, Params)
+{
+  with(as.list(c(State, Params)),
+       {
+         Nj = Sj + Ej +Ij
+         Na = Sa + Ea + Ia
+         N = Nj+Na
+         
+         #adjustment to death and birth rate variables for carrying capacity
+         Y = 1/(1+exp(-r*(N-k)))
+         chi = 1 - Y
+         
+         # juvenile possum odes
+         dSjdt = L*chi*N - (v*(Ia/N)+rbj*(Ij/Nj)+rbaj*(Ia/Na)+f+mj*Y)*Sj
+         dEjdt = (v*(Ia/N)+rbj*(Ij/Nj)+rbaj*(Ia/Na))*Sj - (s+f+mj*Y)*Ej
+         dIjdt = s*Ej - (dj+f+mj*Y)*Ij
+         
+         # adult possum odes
+         dSadt = f*Sj - (rba*(Ia/Na)+rbaj*(Ij/Nj)+(ma*Y))*Sa
+         dEadt = f*Ej + (rba*(Ia/Na)+rbaj*(Ij/Nj))*Sa - (s+ma*Y)*Ea
+         dIadt = f*Ij + s*Ea - (da+ma*Y)*Ia
+         
+         return(list(c(dSjdt, dEjdt, dIjdt, dSadt, dEadt, dIadt)))
+       } )
+}
+
+#convert year rates to day rates
+dayRate = 1/365 
+
+# BASE yearly parameters
+baseYparams  = c( L = 5, #birthrate/year
+                  v = 0.1, #vertical trans rate / year
+                  rbj = 2.1,	#contact trans rate between juveniles /year
+                  rba = 2.1,	#contact trans rate between adults /year
+                  rbaj = 2.1,	#contact trans rate between adults&juveniles /year
+                  f = 1, #CHANGE juveniles -> adults
+                  mj = 0.2, #death rate juveniles/year
+                  s = 5, # rate of exposed -> infected 
+                  da = 1, # TB death rate/year
+                  dj = 1, # TB death rate/year
+                  ma = 0.2, #death rate adults/year
+                  k = 50, #carry capacity/ homesite
+                  r = 0.5) #constant
+
+# Make table for report
+t_baseYParams <- as.matrix(baseYparams)
+vDesc <- c("Birthrate/year", "Vertical transmission rate / year", "Contact transmission rate between juveniles / year", "Contact transmission rate between adults / year", "Contact transmission rate between juveniles and adults / year", "Rate at which Juveniles move to Adults / year", "Natural mortatily rate juveniles / year", "Rate at which Exposed become infectious / year", "bTB mortality rate for adults / year", "bTB mortality rate for juveniles / year", "Natural mortatily rate adults / year", "Carrying capacity of home site", "Constant for logistic growth")
+
+t_baseYParams <- cbind(t_baseYParams, vDesc)
+colnames(t_baseYParams) <- c("Value", "Description")
+
+#Create a table
+t_baseYParams %>%
+  kbl(caption = "Paramater values") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+# BASE daily parameters
+baseDparams = baseYparams*dayRate
+baseDparams["r"] <- 0.5
+baseDparams["k"] <- 50
+
+# EXTENDED yearly parameters            
+yparams <- baseYparams
+yparams["rbj"] <- 1.1
+yparams["rba"] <- 3.1
+yparams["da"] <- 2
+yparams["dj"] <- 0.5
+
+# Make table for report
+t_yparams <- as.matrix(yparams)
+t_yparams <- cbind(t_yparams, vDesc)
+colnames(t_yparams) <- c("Value", "Description")
+
+#Create a table
+t_yparams %>%
+  kbl(caption = "Paramater values") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+# EXTENDED daily parameters            
+dparams = yparams*dayRate
+dparams["r"] <- 0.5
+dparams["k"] <- 50
+
+#initial conditions
+yiniCond = c(Sj = 20, Ej = 0, Ij = 0, 
+             Sa = 30, Ea = 0, Ia = 1)
+
+#time interval 
+#times = seq(0, 20, by = 1)
+
+#Function to calculate R0 - one infected adult introduced
+#Parameters: Initial conditions and parameters
+#Return: R0
+r0func = function(State, Params)
+{
+  with(as.list(c(State, Params)),
+       {  
+         Na = Sa + Ea + Ia
+         Nj = Sj + Ej +Ij
+         N = Na+Nj
+         Y = (1/(1+exp(-r*(N-k))))
+         
+         #rate of transmission * probability of surviving latency * time of infection
+         adultval <- (v*L*(1-Y)+(Sa/Na)*(rba)+(Sj/Nj)*rbaj)*(s/(s+ma*Y))*(1/(da+ma*Y))
+         
+         return(list(c(adultval)))
+       }
+  )
+}
+
+#Function to compare % change of a variable and the change in R0
+#Parameters: tvar is the name of the variable and percChange is the percent change of tvar in both directions
+#Return: dataframe with the results
+sensA = function(tvar, percChange, State, Params) 
+{
+  with(as.list(c(State, Params)),
+       {
+         tmpIni <- dparams[c(tvar)]
+         tmpdf <- data.frame(matrix(ncol = 2, nrow = 20))
+         colnames(tmpdf) = c("percChange", "R0")
+         tmpdf[1,1]<- 0
+         tmpdf[1,2]<- r0func(State, Params)
+         
+         #increase in tvar
+         for(n in 1:20){
+           #new var
+           tmpVal <- tmpIni*(1+n*percChange)
+           tmpdf[n+1,1] <- n*percChange*100
+           #update params with new tmpVal
+           Params[c(tvar)] <- tmpVal
+           #calc R0
+           tmpdf[n+1,2] <- r0func(State,Params)
+         }
+         
+         #decrease in tvar
+         for(n in 1:20){
+           #new var
+           tmpVal <- tmpIni*(1-n*percChange)
+           if(tmpVal <=0){
+             break
+           }
+           tmpdf[n+20,1] <- n*percChange*-100
+           #update params with new tmpVal
+           Params[c(tvar)] <- tmpVal
+           #calc R0
+           tmpdf[n+20,2] <- r0func(State,Params)
+         }
+         
+         #Reset original k value
+         dparams[c(tvar)] <-tmpIni
+         
+         return(tmpdf)
+       } )
+}
+
+```
+
+
+## Running the model
+
+```{r}
+#Base Model
+baseModODE = ode(func = bovineM, y = yiniCond, parms = baseDparams, times = seq(0, 20*365, by = 30))
+baseModdf = as.data.frame(baseModODE)
+#melt dataframe
+baseGraphRes <- reshape2::melt(baseModdf, id="time")
+
+# Extended Model
+modODE = ode(func = bovineM, y = yiniCond, parms = dparams, times = seq(0, 20*365, by = 30))
+moddf = as.data.frame(modODE)
+#melt dataframe
+graphRes <- reshape2::melt(moddf, id="time")
+```
+
+## Graphing the results
+
+```{r}
+#BASE Model
+plot(baseModODE)
+
+#### Total Population - seeing affects of carrying capacity #########
+baseModdf$totPop <- baseModdf$Sj+baseModdf$Ej+baseModdf$Ij+baseModdf$Sa+baseModdf$Ea+baseModdf$Ia
+
+ggplot(data=baseModdf,aes(x=time/365, y=totPop))+
+  geom_line() +
+  #geom_line(data=moddf,aes(x=time/365, y=totPop, color="Extended Model"))+
+  labs(y= "Number of Possums in Home Site", x = "Time (years)", title="Total Population for Home Site Carrying Capacity of 50")
+  
+moddf$totPop <- moddf$Sj+moddf$Ej+moddf$Ij+moddf$Sa+moddf$Ea+moddf$Ia
+
+ggplot(data=moddf,aes(x=time/365, y=totPop, color="red"))+
+  geom_line()
+
+############
+
+baseNumGraph <- ggplot(data=baseGraphRes, aes(x=time/365, y=value, color=factor(variable))) +     
+  geom_line(aes(linetype=factor(variable)), size=0.7) +
+  labs(y= "Number Possums in Home Site", x = "Time (years)", title="Base Bovine TB in Possums") +
+  scale_color_manual(values=c("green", "orange","red","green","orange","red"))+
+  scale_linetype_manual(values=c("solid", "solid","solid","longdash","longdash","longdash"))+
+  theme(legend.title = element_blank())+
+  ylim(0,38) +
+  xlim(0,7)
+
+#Extended Model
+numGraph <- ggplot(data=graphRes, aes(x=time/365, y=value, color=factor(variable))) +
+  geom_line(aes(linetype=factor(variable)), size=0.7) +
+  labs(y= "Number Possums in Home Site", 
+       x = "Time (years)", title="Extended Bovine TB in Possums") +
+  scale_color_manual(values=c("green", "orange","red","green","orange","red"))+
+  scale_linetype_manual(values=c("solid", "solid","solid","longdash","longdash","longdash"))+
+  theme(legend.title = element_blank(), legend.position = c(0.9,0.8)) +
+  #legend(ncol = 1)
+  ylim(0,38) +
+  xlim(0,7)
+
+plot(baseNumGraph)
+plot(numGraph)
+
+#write to .jpg
+jpeg("baseBovineTBGraph.jpg", width=550, height=300, units="px", pointsize=13, quality=100)
+print(baseNumGraph)
+dev.off()
+
+#write to .jpg
+jpeg("extendedBovineTBGraph.jpg", width=550, height=300, units="px", pointsize=13, quality=100)
+print(numGraph)
+dev.off()
+
+#### PLOT FOR SLIDES #####
+
+baseNumGraphSLIDES <- ggplot(data=baseGraphRes, aes(x=time/365, y=value, color=factor(variable))) +     geom_line(aes(linetype=factor(variable)), size=0.7) +
+  labs(y= "Number Possums in Home Site", x = "Time (years)", title="Base Bovine TB in Possums") +
+  scale_linetype_manual(values=c("solid", "solid","solid","longdash","longdash","longdash"))+
+  scale_color_manual(values=c("green", "orange","red","green","orange","red"))+
+  #theme(legend.title = element_blank())+
+  ylim(0,38) +
+  xlim(0,5) +
+  theme(legend.position = "none") 
+
+plot(baseNumGraphSLIDES)
+
+#write to .jpg
+jpeg("baseBovineTBGraph2.jpg", width=550, height=300, units="px", pointsize=13, quality=100)
+print(baseNumGraphSLIDES)
+dev.off()
+
+```
+
+## Calculating R0
+
+```{r}
+
+#Base Model
+bR0 <- r0func(yiniCond,baseDparams)
+#Extended Model
+eR0 <- r0func(yiniCond,dparams)
+
+bR0
+eR0
+
+```
+
+## INFORMAL, exploration of percChang parameter -> new R0
+
+```{r}
+#% change rate of variable
+pval = .1
+
+#Carrying capacity
+kline <- sensA("k", pval, yiniCond, dparams)
+#Transmission rate among adults
+rbaline <- sensA("rba", pval, yiniCond,dparams)
+#Vertical transmission rate
+vline <- sensA("v", pval, yiniCond,dparams)
+#rate of move from latency to infectious
+sline <- sensA("s", pval, yiniCond,dparams)
+#contract transmission rate among juveniles
+rbjline <- sensA("rbj", pval, yiniCond,dparams)
+#contact transmission rate between juveniles + adults
+rbajline <- sensA("rbaj", pval, yiniCond,dparams)
+
+#create grph of results    
+
+allgraph <- ggplot(data=kline, aes(y=R0, x=percChange, color="K")) +
+  geom_line() +
+  ylim(0,3) +
+  xlim(-100,100)+
+  xlab("% Change of Variable") +
+  ylab("New R0")+
+  geom_line(data=rbaline, aes(y=R0, x=percChange, color="rba"))+
+  geom_line(data=vline, aes(y=R0, x=percChange, color="v"))+
+  geom_line(data=sline, aes(y=R0, x=percChange, color="s"))+
+  geom_line(data=rbjline, aes(y=R0, x=percChange, color="rbj"))+
+  geom_line(data=rbajline, aes(y=R0, x=percChange, color="rbaj"))
+
+plot(allgraph)
+
+
+```
+
+## Local sensitivity analysis.
+
+```{r}
+
+#define new function to pass to sensFun function
+solveBTB <- function(pars){
+  modODE = ode(func = bovineM, y = yiniCond, parms = unlist(pars), times = seq(0, 7*365, by = 30))
+  moddf = as.data.frame(modODE)
+  return(moddf)
+}
+
+#Run local sens analysis
+snsA <- sensFun(func = solveBTB, parms = dparams, senspar = c("k","rba","f","rbj","rbaj","da","v", "L"))
+
+#Focus just on Ij and Ia
+snsIaj <- sensFun(func = solveBTB, parms = dparams, sensvar = c("Ij", "Ia"), senspar = c("k","rba","f","rbj","da","v"))
+
+#Focus just on years
+snsIaj$x <- snsIaj$x/365
+
+#long data
+snsIaj_long <- snsIaj %>% 
+  gather(parameter, sensitivity, -x, -var) 
+
+#plot
+s1 <- ggplot(snsIaj_long, aes(x = x, y = sensitivity)) +
+  geom_line(aes(colour = parameter, linetype = var), size=0.7) +
+  scale_color_brewer("Parameter", palette = "Dark2") +
+  #scale_linetype_discrete("Variable") +
+  scale_linetype_manual(values=c("longdash","solid"))+
+  labs(title = "Local Sensitivity Analysis of Ij & Ia",x = "Time(years)", y = "Sensitivity")
+plot(s1)
+
+#write to .jpg
+jpeg("localSensAna.jpg", width=550, height=300, units="px", pointsize=13, quality=100)
+print(s1)
+dev.off()
+
+```
+
+
+
+## Global Sensitivity Analysis (Sobol')
+
+```{r}
+N <- 51
+R <- 5000
+sparams <- c("L", "v", "rbj", "rba", "rbaj", "f", "mj","s","da","dj","ma","k", "r")
+order <- "first"
+type <- "norm"
+smat <- sobol_matrices(N=N, params=sparams, order=order)
+timeOutput <- seq(2, 6.5, 0.5)
+
+#Used to transform each column to the probability distributions
+smat[, "L"] <- qunif(smat[, "L"],2,6)
+smat[, "v"] <- qunif(smat[, "v"],0.05,3)
+smat[, "rbj"] <- qunif(smat[, "rbj"],1.1,5.1)
+smat[, "rba"] <- qunif(smat[,"rba" ],1.1,5.1)
+smat[, "rbaj"] <- qunif(smat[, "rbaj"],1.1,5.1)
+smat[, "f"] <- qunif(smat[, "f"],0.5,1.5)
+smat[, "mj"] <- qunif(smat[,"mj" ],0.1,0.4)
+smat[, "s"] <- qunif(smat[, "s"],4,7)
+smat[, "da"] <- qunif(smat[, "da"],1,2)
+smat[, "dj"] <- qunif(smat[, "dj"],0.5,1)
+smat[, "ma"] <- qunif(smat[, "ma"],0.1,0.4)
+smat[, "k"] <- qunif(smat[,"k" ],45,55)
+smat[, "r"] <- qunif(smat[, "r"],0.5,0.5)
+
+#run sobol_ode
+y <- foreach(j = timeOutput, .combine = "rbind") %:% foreach(i = 1:nrow(smat), .combine = "rbind") %dopar%
+  {
+    sobol_ode(d = smat[i, ], times = seq(0, j, 1), state = yiniCond, func = bovineM)
+  }
+
+saData <- data.table(cbind(y, times = rep(timeOutput, each = nrow(smat))))
+meltSAData <- melt(saData, measure.vars = c("Sj", "Ej", "Ij", "Sa", "Ea", "Ia"))
+
+#Sobol' indices
+indices <- meltSAData[, sobol_indices(Y = value, N = N, params = sparams, order = order, boot = TRUE, first = "jansen", R = R)$results, .(variable, times)]
+
+#a parameter that has no influence on the model output, to estimate the numerical approximation error
+indices_dummy <- meltSAData[, sobol_dummy(Y = value, N = N, params = sparams), .(variable, times)]
+
+#subsetting the output to view graphs
+ind1 <- indices[(which((indices$variable=="Ij"|indices$variable=="Ia") & (indices$parameters==c("da")|indices$parameters==c("f")|indices$parameters==c("rba"))))]
+
+ind1_dummy <- indices_dummy[(which((indices_dummy$variable=="Ij"|indices_dummy$variable=="Ia")))]
+
+#Si: tells % of uncertainty that the parameter is responsible (first order effect)
+#Ti: the total-order index measures the first-order effect of the parameter jointly with its interactions with all other parameters
+#If Ti = 0, indicates that the parameter does not convey any uncertainty to the model output, the total-order index is used to screen influential from non-influential parameters
+
+g1 <- ggplot(ind1, aes(times, original, fill = sensitivity,color = sensitivity, group = sensitivity)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = ind1[sensitivity %in% c("Si", "Ti")]$low.ci, ymax = ind1[sensitivity %in% c("Si", "Ti")]$high.ci,color = sensitivity), alpha = 0.1, linetype = 0) +
+  geom_hline(data = ind1_dummy[, parameters:= NULL][sensitivity == "Ti"], aes(yintercept = original, color = sensitivity, group = times), lty = 2, size = 0.1) +
+  guides(linetype = FALSE, color = FALSE) +
+  facet_grid(parameters ~ variable) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  labs(x = expression(italic(t)),
+       y = "Sobol' indices") +
+  theme(legend.position = "right")
+
+plot(g1)
+
+#write to .jpg
+jpeg("globalSensAna.jpg", width=550, height=650, units="px", pointsize=13, quality=100)
+print(g1)
+dev.off()
+
+```
+
